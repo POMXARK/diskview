@@ -2267,6 +2267,69 @@ def drives():
     return ["%s:\\" % c for c in "CDEFGHIJKLMNOPQRSTUVWXYZ" if os.path.exists("%s:\\" % c)]
 
 
+def _explorer_hwnds():
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    out = []
+    cb_t = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd, _):
+        if u.IsWindowVisible(hwnd):
+            cls = ctypes.create_unicode_buffer(64)
+            u.GetClassNameW(hwnd, cls, 64)
+            if cls.value == "CabinetWClass":
+                t = ctypes.create_unicode_buffer(260)
+                u.GetWindowTextW(hwnd, t, 260)
+                out.append((hwnd, t.value))
+        return True
+
+    u.EnumWindows(cb_t(cb), 0)
+    return out
+
+
+def _bring_front(hwnd):
+    import ctypes
+    u = ctypes.windll.user32
+    k = ctypes.windll.kernel32
+    if u.IsIconic(hwnd):
+        u.ShowWindow(hwnd, 9)
+    fg = u.GetForegroundWindow()
+    cur_t = k.GetCurrentThreadId()
+    fg_t = u.GetWindowThreadProcessId(fg, None) if fg else 0
+    if fg_t and fg_t != cur_t:
+        u.AttachThreadInput(cur_t, fg_t, True)
+    try:
+        u.BringWindowToTop(hwnd)
+        u.SetForegroundWindow(hwnd)
+    finally:
+        if fg_t and fg_t != cur_t:
+            u.AttachThreadInput(cur_t, fg_t, False)
+    if u.GetForegroundWindow() != hwnd:
+        u.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0003)
+        u.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0003)
+        u.SetForegroundWindow(hwnd)
+
+
+def _focus_explorer(before, hint):
+    hl = (hint or "").lower()
+    for step in range(15):
+        time.sleep(0.1)
+        cur = _explorer_hwnds()
+        for hwnd, _ in cur:
+            if hwnd not in before:
+                _bring_front(hwnd)
+                return
+        if step >= 4 and cur:
+            if hl:
+                for hwnd, title in cur:
+                    if hl in title.lower():
+                        _bring_front(hwnd)
+                        return
+            _bring_front(cur[0][0])
+            return
+
+
 def reveal(path):
     if not path:
         return False
@@ -2275,11 +2338,22 @@ def reveal(path):
     if d is None and sc.find(path) is None and not in_library(path) and not os.path.exists(path):
         return False
     if os.name == "nt":
+        import ctypes
         np = _norm_root(path)
-        if len(np) == 3 and np[1:] == ":\\":
+        is_root = len(np) == 3 and np[1:] == ":\\"
+        before = {h for h, _ in _explorer_hwnds()}
+        try:
+            ctypes.windll.user32.AllowSetForegroundWindow(0xFFFFFFFF)
+        except Exception:
+            pass
+        if is_root:
+            hint = np
             subprocess.Popen(["explorer", np])
         else:
+            parent = os.path.dirname(np)
+            hint = os.path.basename(parent.rstrip("\\/")) or parent
             subprocess.Popen(["explorer", "/select,", np])
+        threading.Thread(target=_focus_explorer, args=(before, hint), daemon=True).start()
     elif sys.platform == "darwin":
         subprocess.Popen(["open", "-R", path])
     else:

@@ -2271,6 +2271,12 @@ def _explorer_hwnds():
     import ctypes
     from ctypes import wintypes
     u = ctypes.windll.user32
+    u.IsWindowVisible.argtypes = [wintypes.HWND]
+    u.IsWindowVisible.restype = wintypes.BOOL
+    u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    u.GetClassNameW.restype = ctypes.c_int
+    u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    u.GetWindowTextW.restype = ctypes.c_int
     out = []
     cb_t = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -2284,14 +2290,38 @@ def _explorer_hwnds():
                 out.append((hwnd, t.value))
         return True
 
+    u.EnumWindows.argtypes = [cb_t, wintypes.LPARAM]
+    u.EnumWindows.restype = wintypes.BOOL
     u.EnumWindows(cb_t(cb), 0)
     return out
 
 
 def _bring_front(hwnd):
     import ctypes
+    from ctypes import wintypes
     u = ctypes.windll.user32
     k = ctypes.windll.kernel32
+    u.IsIconic.argtypes = [wintypes.HWND]
+    u.IsIconic.restype = wintypes.BOOL
+    u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    u.ShowWindow.restype = wintypes.BOOL
+    u.GetForegroundWindow.argtypes = []
+    u.GetForegroundWindow.restype = wintypes.HWND
+    k.GetCurrentThreadId.argtypes = []
+    k.GetCurrentThreadId.restype = wintypes.DWORD
+    u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    u.GetWindowThreadProcessId.restype = wintypes.DWORD
+    u.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    u.AttachThreadInput.restype = wintypes.BOOL
+    u.BringWindowToTop.argtypes = [wintypes.HWND]
+    u.BringWindowToTop.restype = wintypes.BOOL
+    u.SetForegroundWindow.argtypes = [wintypes.HWND]
+    u.SetForegroundWindow.restype = wintypes.BOOL
+    u.SetWindowPos.argtypes = [
+        wintypes.HWND, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT,
+    ]
+    u.SetWindowPos.restype = wintypes.BOOL
     if u.IsIconic(hwnd):
         u.ShowWindow(hwnd, 9)
     fg = u.GetForegroundWindow()
@@ -2306,8 +2336,8 @@ def _bring_front(hwnd):
         if fg_t and fg_t != cur_t:
             u.AttachThreadInput(cur_t, fg_t, False)
     if u.GetForegroundWindow() != hwnd:
-        u.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0003)
-        u.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0003)
+        u.SetWindowPos(hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0, 0x0003)
+        u.SetWindowPos(hwnd, ctypes.c_void_p(-2), 0, 0, 0, 0, 0x0003)
         u.SetForegroundWindow(hwnd)
 
 
@@ -2343,7 +2373,10 @@ def reveal(path):
         is_root = len(np) == 3 and np[1:] == ":\\"
         before = {h for h, _ in _explorer_hwnds()}
         try:
-            ctypes.windll.user32.AllowSetForegroundWindow(0xFFFFFFFF)
+            u = ctypes.windll.user32
+            u.AllowSetForegroundWindow.argtypes = [ctypes.c_uint32]
+            u.AllowSetForegroundWindow.restype = ctypes.c_int
+            u.AllowSetForegroundWindow(0xFFFFFFFF)
         except Exception:
             pass
         if is_root:
@@ -2547,7 +2580,7 @@ tr.r:hover{background:var(--pan)}tr.sel{background:var(--sel)!important}
 td.nm{max-width:520px;overflow:hidden;text-overflow:ellipsis}.tg{display:inline-block;width:16px;color:var(--mut);cursor:pointer}
 .bar{display:inline-block;height:9px;background:var(--acc);opacity:.6;vertical-align:middle;border-radius:2px}
 #lbx{position:fixed;inset:0;background:#000d;z-index:99;display:flex;align-items:center;justify-content:center}#lbx img{max-width:92vw;max-height:90vh;border-radius:6px;box-shadow:0 8px 40px #000}#lbx b{position:absolute;color:#fff;cursor:pointer;font-size:34px;padding:10px 16px;user-select:none;background:#0006;border-radius:8px}#lbx .lp{left:14px}#lbx .ln{right:14px}#lbx .lx{right:14px;top:10px;font-size:24px}#lbx .lc{position:absolute;bottom:12px;color:#fff;font-size:13px}#edc{position:fixed;inset:0;background:#0007;z-index:50;display:flex;align-items:center;justify-content:center}#edc .ebox{background:var(--pan);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:16px;width:min(560px,94vw);max-height:92vh;overflow:auto}#edc h3{margin:0 0 2px}#edc .ep{color:var(--mut);font-size:12px;margin-bottom:8px;word-break:break-all}#edc label{display:block;margin:8px 0 2px;font-size:12px;color:var(--mut)}#edc input:not([type=file]),#edc textarea{width:100%;box-sizing:border-box;display:block;margin-top:2px}#edc .er{display:flex;gap:6px}#edc .er input{flex:1}#edc .eprev{display:flex;gap:4px;flex-wrap:wrap;margin-top:8px}#edc .eprev img{height:56px;border-radius:4px}#edc .ebt{display:flex;gap:8px;margin-top:12px}.old{color:#d33}.new{color:#2a9d4a}.tile{border:1px solid var(--line);border-radius:8px;padding:10px;background:var(--pan);cursor:pointer;min-width:0}.tile:hover{border-color:var(--acc)}.card{padding:0;overflow:hidden;display:flex;flex-direction:column;background:var(--pan)}.card .art{position:relative;height:130px;background:linear-gradient(135deg,#1f2a44,#3b2a55);display:flex;align-items:center;justify-content:center;overflow:hidden}.card .art .cv{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.card .art .ic{width:84px;height:84px;object-fit:contain;filter:drop-shadow(0 3px 6px #0008)}.card .art .fb{font-size:56px;line-height:84px;text-align:center}.card .sz{position:absolute;left:6px;bottom:6px;background:#000a;color:#fff;border-radius:10px;padding:1px 8px;font-size:12px}.card .rb{position:absolute;left:6px;top:6px;font-size:14px;background:#000a;border-radius:10px;padding:0 5px}.card .act{position:absolute;right:6px;top:6px;display:flex;gap:4px;opacity:0;transition:opacity .15s}.card:hover .act,.card:focus-within .act{opacity:1}.card .act button{padding:2px 7px;background:#000b;color:#fff;border:1px solid #fff4;border-radius:6px}.card .shots{display:flex;gap:2px;background:#000}.card .shots a{flex:1;min-width:0}.card .shots img{width:100%;height:50px;object-fit:cover;display:block}.card .grp{margin-top:6px;font-size:12px;color:var(--mut)}.card .grp summary{cursor:pointer;color:var(--acc)}.card .gi{display:flex;gap:6px;align-items:center;margin:2px 0}.card .gi span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.card .gi a{text-decoration:none}.card .meta{padding:8px 10px 10px;min-width:0}.card .sub{color:var(--mut);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.card .ds.open{-webkit-line-clamp:unset;overflow:visible}.card .ds{cursor:pointer;margin:5px 0;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;white-space:normal;font-size:13px}.card .ctg{white-space:normal;line-height:1.9}.tile b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;padding:10px 12px}.chip{display:inline-block;white-space:nowrap;background:var(--sel);border-radius:9px;padding:0 7px;margin-right:3px;font-size:12px;cursor:pointer}.chip a{color:inherit;text-decoration:none;opacity:.55;margin-left:2px}.chip a:hover{opacity:1;color:#d33}.rk{font-weight:600}.rk0{color:#2a9d4a}.rk1{color:#c80}.rk2{color:#d33}td.wr{white-space:normal;max-width:280px;text-align:left}
-#tm{display:block;width:100%;height:100%}#crumb{position:absolute;left:8px;top:6px;background:var(--bg);border:1px solid var(--line);border-radius:5px;padding:2px 8px;z-index:2}
+#tm{display:block;width:100%;height:100%}#crumb{position:absolute;left:8px;top:6px;background:var(--bg);border:1px solid var(--line);border-radius:5px;padding:2px 8px;z-index:2}#crumb a{color:var(--acc);text-decoration:none}#crumb a:hover{text-decoration:underline}
 #tip{position:fixed;pointer-events:none;background:#000d;color:#fff;padding:5px 8px;border-radius:5px;font-size:12px;display:none;z-index:9;white-space:pre}
 footer{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:6px 12px;background:var(--pan);border-top:1px solid var(--line)}
 footer span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -2733,8 +2766,8 @@ async function rMap(g=rGen){const m=$("#main");m.innerHTML=`<div id="crumb"></di
   m.innerHTML=`<div style="padding:16px;color:var(--mut)">${esc((d&&d.error)||"Нет данных.")}</div>`;return}
  const ctx=cv.getContext("2d");
  const parts=mapPath.slice(rootPath.length).split(sep).filter(Boolean);let acc=rootPath.replace(/[\\\/]$/,"");
- $("#crumb").innerHTML=`<a href="#" data-p="${esc(rootPath)}">${esc(rootPath)}</a>`+parts.map(p=>{acc+=sep+p;return ` ${sep} <a href="#" data-p="${esc(acc)}">${esc(p)}</a>`}).join("");
- $("#crumb").onclick=e=>{e.preventDefault();if(e.target.dataset.p){mapPath=e.target.dataset.p;rMap()}};
+ $("#crumb").innerHTML=`<a href="#" data-p="${esc(rootPath)}">${esc(rootPath)}</a>`+parts.map(p=>{acc+=sep+p;return ` › <a href="#" data-p="${esc(acc)}">${esc(p)}</a>`}).join("")+` <a class="opi" href="#" data-open="${esc(mapPath)}" title="Открыть в Проводнике">↗</a>`;
+ $("#crumb").onclick=e=>{if(e.target.closest("[data-open]"))return;e.preventDefault();if(e.target.dataset.p){mapPath=e.target.dataset.p;rMap()}};
  const items=d.children.filter(x=>x.size>0).map(x=>({...x,v:x.size}));const rects=items.length?squarify(items,0,30,cv.width,cv.height-30):[];const f=fi();
  for(const r of rects){const n=r.it;ctx.fillStyle=n.misc?"#778":col(n.t[f]);ctx.fillRect(r.x,r.y,r.w,r.h);ctx.strokeStyle="#0006";ctx.strokeRect(r.x+.5,r.y+.5,r.w-1,r.h-1);
   if(r.w>60&&r.h>28){ctx.fillStyle="#fff";ctx.font="12px system-ui";ctx.save();ctx.beginPath();ctx.rect(r.x,r.y,r.w,r.h);ctx.clip();ctx.fillText(n.name,r.x+4,r.y+14);ctx.fillText(fmt(n.size),r.x+4,r.y+28);ctx.restore()}}

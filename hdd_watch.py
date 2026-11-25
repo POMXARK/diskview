@@ -319,6 +319,8 @@ def main():
                 rows.append((pid, cur[0], r_kbps, w_kbps, r_iops, w_iops, cur[1]))
 
             rows.sort(key=lambda x: (x[2] + x[3], x[4] + x[5]), reverse=True)
+            if not args.once:
+                os.system("cls")
             render(disks, rows, dt, args.top)
             if args.once:
                 break

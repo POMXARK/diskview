@@ -84,7 +84,6 @@ class Scan:
         self.reused = 0
 
     def run(self, path, keep_mb, full=False):
-        old = None if full else load_scan(path, keep_mb)
         self.reused = 0
         self.cached = 0
         self.state = "scanning"
@@ -95,8 +94,15 @@ class Scan:
         self.t0 = time.time()
         try:
             st = os.stat(path)
-            log("сканирование %s (%s)" % (path, "быстрое, по кэшу" if old else "полное"))
-            self.root = self._dir(path, path, st.st_ctime, st.st_mtime, old)
+            root = None
+            if self._can_mft(path):
+                log("сканирование %s (NTFS MFT)" % path)
+                root = self._mft_scan(path)
+            if root is None and not self.cancel:
+                old = None if full else load_scan(path, keep_mb)
+                log("сканирование %s (%s)" % (path, "быстрое, по кэшу" if old else "полное"))
+                root = self._dir(path, path, st.st_ctime, st.st_mtime, old)
+            self.root = root
             self.state = "cancelled" if self.cancel else "done"
             if self.state == "done":
                 save_cards()
@@ -106,11 +112,97 @@ class Scan:
             self.state = "error: %s" % e
         self.elapsed = time.time() - self.t0
 
+    def _mft_exe(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "mft_scan.exe")
+
+    def _can_mft(self, path):
+        if os.name != "nt" or not os.path.isfile(self._mft_exe()):
+            return False
+        p = os.path.normpath(path)
+        return len(p) == 3 and p[0].isalpha() and p[1:] == ":\\"
+
+    def _mft_scan(self, path):
+        os.makedirs(DATA, exist_ok=True)
+        tmp_json = os.path.join(DATA, "mft_%d.json" % os.getpid())
+        norm_root = os.path.normpath(path)
+        if len(norm_root) == 2 and norm_root[1] == ":":
+            norm_root += "\\"
+        try:
+            proc = subprocess.Popen(
+                [self._mft_exe(), norm_root, str(self.keep), tmp_json],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                creationflags=0x08000000,
+            )
+        except OSError as e:
+            log("MFT пропущен (%s), использую обычный обход" % e)
+            return None
+        try:
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    if self.cancel:
+                        proc.terminate()
+                        return None
+                    parts = line.strip().split()
+                    if len(parts) == 4 and parts[0] == "P":
+                        try:
+                            self.files = int(parts[1])
+                            self.bytes = int(parts[2])
+                            self.cur = "%s (MFT %s%%)" % (norm_root, parts[3])
+                        except ValueError:
+                            pass
+            rc = proc.wait()
+            err_msg = proc.stderr.read().strip() if proc.stderr is not None else ""
+            if rc != 0 or not os.path.isfile(tmp_json):
+                log("MFT пропущен (%s), использую обычный обход" % (err_msg or ("rc=%d" % rc)))
+                return None
+            self.cur = "%s (загрузка дерева…)" % norm_root
+            sys.setrecursionlimit(max(sys.getrecursionlimit(), 5000))
+            with open(tmp_json, "r", encoding="utf-8") as f:
+                tree = json.load(f)
+            root = _undump(tree)
+            self.files = root.files
+            self.bytes = root.size
+            self.cur = ""
+            return root
+        except (OSError, ValueError, KeyError, IndexError, TypeError) as e:
+            log("MFT ошибка (%s), использую обычный обход" % e)
+            return None
+        finally:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except OSError:
+                pass
+            try:
+                if os.path.isfile(tmp_json):
+                    os.remove(tmp_json)
+            except OSError:
+                pass
+
     def _dir(self, path, name, ctime, mt=0.0, old=None):
         d = Dir(name, ctime)
         d.mt = mt
         reuse = old is not None and old.own is not None and old.mt == mt and not old.err
-        own = [0, 0, None, 0.0, 0.0]
+        if reuse and not old.dirs:
+            own = [old.own[0], old.own[1], list(old.own[2]) if old.own[2] else None, old.own[3], old.own[4]]
+            d.own = own
+            d.fl = list(old.fl)
+            d.size = own[0]
+            d.files = own[1]
+            d.t[1] = own[3]
+            d.t[2] = own[4]
+            if own[2]:
+                d.cat = list(own[2])
+            self.files += own[1]
+            self.bytes += own[0]
+            self.reused += 1
+            return d
+        own_sz = 0
+        own_n = 0
+        own_cat = None
+        own_t1 = 0.0
+        own_t2 = 0.0
         self.cur = path
         try:
             it = os.scandir(path)
@@ -118,6 +210,7 @@ class Scan:
             d.err = True
             self.errors += 1
             return d
+        is_nt = os.name == "nt"
         with it:
             for e in it:
                 if self.cancel:
@@ -126,37 +219,55 @@ class Scan:
                     if reuse and not e.is_dir(follow_symlinks=False):
                         continue
                     s = e.stat(follow_symlinks=False)
-                    if getattr(s, "st_file_attributes", 0) & REPARSE or e.is_symlink():
-                        continue
-                    if e.is_dir(follow_symlinks=False):
+                    if is_nt:
+                        attr = s.st_file_attributes
+                        if attr & REPARSE:
+                            continue
+                        is_d = bool(attr & 0x10)
+                    else:
+                        if getattr(s, "st_file_attributes", 0) & REPARSE or e.is_symlink():
+                            continue
+                        is_d = e.is_dir(follow_symlinks=False)
+                    if is_d:
                         sub = self._dir(e.path, e.name, s.st_ctime, s.st_mtime, old.dirs.get(e.name) if old else None)
                         d.dirs[e.name] = sub
                         d.size += sub.size
                         d.files += sub.files
-                        d.t[1] = max(d.t[1], sub.t[1])
-                        d.t[2] = max(d.t[2], sub.t[2])
+                        if sub.t[1] > d.t[1]:
+                            d.t[1] = sub.t[1]
+                        if sub.t[2] > d.t[2]:
+                            d.t[2] = sub.t[2]
                         if sub.cat:
                             if d.cat is None:
                                 d.cat = [0] * NCAT
                             for i, v in enumerate(sub.cat):
                                 d.cat[i] += v
                     else:
-                        k = _E.get(os.path.splitext(e.name)[1].lower(), NCAT - 1)
-                        own[0] += s.st_size
-                        own[1] += 1
-                        if own[2] is None:
-                            own[2] = [0] * NCAT
-                        own[2][k] += s.st_size
-                        own[3] = max(own[3], s.st_mtime)
-                        own[4] = max(own[4], s.st_atime)
-                        if s.st_size >= self.keep:
-                            d.fl.append((e.name, s.st_size, s.st_ctime, s.st_mtime, s.st_atime))
+                        en = e.name
+                        dot = en.rfind(".")
+                        k = _E.get(en[dot:].lower(), NCAT - 1) if dot >= 0 else NCAT - 1
+                        fsz = s.st_size
+                        fmt = s.st_mtime
+                        fat = s.st_atime
+                        own_sz += fsz
+                        own_n += 1
+                        if own_cat is None:
+                            own_cat = [0] * NCAT
+                        own_cat[k] += fsz
+                        if fmt > own_t1:
+                            own_t1 = fmt
+                        if fat > own_t2:
+                            own_t2 = fat
+                        if fsz >= self.keep:
+                            d.fl.append((en, fsz, s.st_ctime, fmt, fat))
                 except OSError:
                     self.errors += 1
         if reuse and not self.cancel:
             own = [old.own[0], old.own[1], list(old.own[2]) if old.own[2] else None, old.own[3], old.own[4]]
             d.fl = list(old.fl)
             self.reused += 1
+        else:
+            own = [own_sz, own_n, own_cat, own_t1, own_t2]
         d.own = own
         d.size += own[0]
         d.files += own[1]
@@ -167,8 +278,10 @@ class Scan:
                 d.cat = [0] * NCAT
             for i, v in enumerate(own[2]):
                 d.cat[i] += v
-        d.t[1] = max(d.t[1], own[3])
-        d.t[2] = max(d.t[2], own[4])
+        if own[3] > d.t[1]:
+            d.t[1] = own[3]
+        if own[4] > d.t[2]:
+            d.t[2] = own[4]
         return d
 
     def find(self, path):
@@ -232,7 +345,7 @@ def save_scan():
         meta = {"path": SC.root_path, "keep": SC.keep, "ts": int(time.time()), "files": SC.files, "bytes": SC.bytes,
                 "errors": SC.errors, "elapsed": SC.elapsed}
         sys.setrecursionlimit(max(sys.getrecursionlimit(), 5000))
-        with gzip.open(os.path.join(DATA, _scan_file(SC.root_path)), "wt", encoding="utf-8") as f:
+        with gzip.open(os.path.join(DATA, _scan_file(SC.root_path)), "wt", encoding="utf-8", compresslevel=1) as f:
             json.dump({"meta": meta, "tree": _dump(SC.root)}, f, ensure_ascii=False)
         _jsave("scan_last.json", meta)
     except (OSError, RecursionError) as e:

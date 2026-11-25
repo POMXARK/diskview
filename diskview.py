@@ -2343,21 +2343,22 @@ def _bring_front(hwnd):
 
 def _focus_explorer(before, hint):
     hl = (hint or "").lower()
-    for step in range(15):
+    for step in range(30):
         time.sleep(0.1)
         cur = _explorer_hwnds()
         for hwnd, _ in cur:
             if hwnd not in before:
                 _bring_front(hwnd)
                 return
-        if step >= 4 and cur:
-            if hl:
-                for hwnd, title in cur:
-                    if hl in title.lower():
-                        _bring_front(hwnd)
-                        return
-            _bring_front(cur[0][0])
-            return
+        for hwnd, title in cur:
+            if before.get(hwnd) != title and (not hl or hl in title.lower()):
+                _bring_front(hwnd)
+                return
+        if step >= 10 and hl:
+            for hwnd, title in cur:
+                if hl in title.lower():
+                    _bring_front(hwnd)
+                    return
 
 
 def reveal(path):
@@ -2371,7 +2372,7 @@ def reveal(path):
         import ctypes
         np = _norm_root(path)
         is_root = len(np) == 3 and np[1:] == ":\\"
-        before = {h for h, _ in _explorer_hwnds()}
+        before = dict(_explorer_hwnds())
         try:
             u = ctypes.windll.user32
             u.AllowSetForegroundWindow.argtypes = [ctypes.c_uint32]
@@ -2380,11 +2381,14 @@ def reveal(path):
         except Exception:
             pass
         if is_root:
-            hint = np
+            hint = "(%s:)" % np[0]
             subprocess.Popen(["explorer", np])
         else:
             parent = os.path.dirname(np)
-            hint = os.path.basename(parent.rstrip("\\/")) or parent
+            if len(parent) == 3 and parent[1:] == ":\\":
+                hint = "(%s:)" % parent[0]
+            else:
+                hint = os.path.basename(parent.rstrip("\\/"))
             subprocess.Popen(["explorer", "/select,", np])
         threading.Thread(target=_focus_explorer, args=(before, hint), daemon=True).start()
     elif sys.platform == "darwin":

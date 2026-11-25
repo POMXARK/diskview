@@ -626,6 +626,70 @@ def stale(field, years, min_size, limit, root=None):
     return {"total": sum(r["size"] for r in res), "count": len(res), "items": res[:limit]}
 
 
+def files_view(q="", ext="", min_size=0, sort="size", limit=500, root=None):
+    """Плоский список файлов в стиле WizTree: поиск, фильтр по расширению и размеру, сортировка."""
+    sc = get_scan(root) if root else SC
+    if not sc or not sc.root:
+        return {"total": 0, "count": 0, "root_size": 0, "keep": 0, "exts": [], "items": []}
+    q_toks = [t for t in (q or "").lower().split() if t]
+    exts = {("." + x.strip().lstrip(".").lower()) for x in (ext or "").split(",") if x.strip()}
+    matches = []
+    ext_totals = {}
+    total_bytes = 0
+
+    def walk(d, path):
+        nonlocal total_bytes
+        for f in d.fl:
+            sz = f[1]
+            if sz < min_size:
+                continue
+            name = f[0]
+            dot = name.rfind(".")
+            fe = name[dot:].lower() if dot >= 0 else ""
+            if exts and fe not in exts:
+                continue
+            fp = os.path.join(path, name)
+            if q_toks:
+                fpl = fp.lower()
+                if not all(t in fpl for t in q_toks):
+                    continue
+            total_bytes += sz
+            ek = fe or "(без расш.)"
+            et = ext_totals.get(ek)
+            if et is None:
+                ext_totals[ek] = [sz, 1]
+            else:
+                et[0] += sz
+                et[1] += 1
+            matches.append((fp, f, fe))
+        for n, c in d.dirs.items():
+            walk(c, os.path.join(path, n))
+
+    walk(sc.root, sc.root_path)
+    key_fn = {
+        "size": lambda x: -x[1][1],
+        "m": lambda x: -x[1][3],
+        "a": lambda x: -x[1][4],
+        "c": lambda x: -x[1][2],
+        "name": lambda x: x[1][0].lower(),
+    }.get(sort, lambda x: -x[1][1])
+    matches.sort(key=key_fn)
+    top_exts = sorted([[k, v[0], v[1]] for k, v in ext_totals.items()], key=lambda x: -x[1])[:14]
+    items = []
+    for fp, f, fe in matches[:limit]:
+        it = jfile(f, os.path.dirname(fp))
+        it["ext"] = fe
+        items.append(it)
+    return {
+        "total": total_bytes,
+        "count": len(matches),
+        "root_size": sc.root.size,
+        "keep": sc.keep,
+        "exts": top_exts,
+        "items": items,
+    }
+
+
 def detach(path):
     """Убрать узел из дерева и вычесть его размер у предков."""
     sc = find_scan_for_path(path)
@@ -654,7 +718,13 @@ def detach(path):
 def check_target(path):
     sc = find_scan_for_path(path)
     d = sc.find(path)
-    if d is None or protected(path, sc):
+    is_file = False
+    if d is None:
+        parent = sc.find(os.path.dirname(path))
+        bn = os.path.basename(path)
+        if parent is not None and bn:
+            is_file = any((f[0].lower() == bn.lower() if os.name == "nt" else f[0] == bn) for f in parent.fl)
+    if (d is None and not is_file) or protected(path, sc):
         return "это место защищено или не из сканирования"
     if sc.state == "scanning":
         return "идёт сканирование"
@@ -2478,6 +2548,15 @@ class H(BaseHTTPRequestHandler):
             return self.send(stale(q.get("field", "m"), float(q.get("years", 1)),
                                    float(q.get("min", 100)) * (1 << 20), int(q.get("limit", 500)),
                                    root=q.get("root")))
+        if u.path == "/api/files":
+            return self.send(files_view(
+                q=q.get("q", ""),
+                ext=q.get("ext", ""),
+                min_size=int(float(q.get("min", 0) or 0) * (1 << 20)),
+                sort=q.get("sort", "size"),
+                limit=int(q.get("limit", 500) or 500),
+                root=q.get("root"),
+            ))
         self.send({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -2600,7 +2679,7 @@ footer span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
  <button id="web" disabled title="Поиск в интернете: наружу уходит только имя файла/папки">🌐 В интернете</button><button id="cfg">⚙ Модель</button><span class="legend">свежее<i></i>старше 3 лет</span>
 </header>
 <div id="st">Выберите диск или папку и нажмите «Сканировать».</div>
-<nav><button data-v="tree" class="on">Папки</button><button data-v="map">Карта</button><button data-v="old">Мёртвые папки</button><button data-v="launch">Лаунчер</button><button data-v="lib">Библиотека</button><button id="rld" title="Перезагрузить страницу" style="margin-left:auto">⟳ Страница</button><button id="rsv" title="Перезапустить сервер DiskView (подхватит обновлённый diskview.py) и обновить страницу">↻ Сервер</button><button id="logb" title="Панель логов: что сейчас делает сервер (разметка, поиск в Steam, сеть)">📜 Логи</button><button id="quit" title="Остановить сервер DiskView">⏻ Выход</button></nav>
+<nav><button data-v="tree" class="on">Папки</button><button data-v="files">Файлы</button><button data-v="map">Карта</button><button data-v="old">Мёртвые папки</button><button data-v="launch">Лаунчер</button><button data-v="lib">Библиотека</button><button id="rld" title="Перезагрузить страницу" style="margin-left:auto">⟳ Страница</button><button id="rsv" title="Перезапустить сервер DiskView (подхватит обновлённый diskview.py) и обновить страницу">↻ Сервер</button><button id="logb" title="Панель логов: что сейчас делает сервер (разметка, поиск в Steam, сеть)">📜 Логи</button><button id="quit" title="Остановить сервер DiskView">⏻ Выход</button></nav>
 <main id="main"></main>
 <dialog id="dlg" style="border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);min-width:460px;max-width:90vw"><form method="dialog" id="cf" style="display:grid;gap:6px">
 <b>Модель для помощника</b><div style="color:var(--mut)">Любой сервер: Ollama или OpenAI-совместимый (LM Studio, llama.cpp, vLLM, OpenRouter, OpenAI…). В модель уходят только метаданные папок (названия, размеры, даты, типы, теги), не содержимое файлов.</div>
@@ -2670,7 +2749,7 @@ $("#rsv").onclick=async()=>{const b=$("#rsv");b.disabled=true;b.textContent="↻
 $("#quit").onclick=async()=>{if(!confirm("Остановить сервер DiskView и закрыть программу?"))return;try{await api("/api/quit",{})}catch(x){}document.body.innerHTML='<div style="padding:40px;font:16px sans-serif">Сервер остановлен. Эту вкладку можно закрыть.</div>';window.close()};
 document.querySelector("nav").onclick=e=>{if(!e.target.dataset.v)return;view=e.target.dataset.v;document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("on",b==e.target));render()};
 $("#field").onchange=render;
-function render(){const g=++rGen;if(!rootPath&&view!="lib"&&view!="launch"){$("#main").innerHTML=`<div style="padding:24px;color:var(--mut)">Диск ещё не просканирован (после перезапуска сервера результат сканирования сбрасывается). <button id="go2" class="p">Сканировать ${esc($("#path").value)}</button></div>`;$("#go2").onclick=()=>$("#go").click();return}({tree:rTree,map:rMap,old:rOld,lib:rLib,launch:rLaunch})[view](g)}
+function render(){const g=++rGen;if(!rootPath&&view!="lib"&&view!="launch"){$("#main").innerHTML=`<div style="padding:24px;color:var(--mut)">Диск ещё не просканирован (после перезапуска сервера результат сканирования сбрасывается). <button id="go2" class="p">Сканировать ${esc($("#path").value)}</button></div>`;$("#go2").onclick=()=>$("#go").click();return}({tree:rTree,files:rFiles,map:rMap,old:rOld,lib:rLib,launch:rLaunch})[view](g)}
 const RK=["можно чистить","осторожно","защищено"];
 const tg=n=>(n.tags||[]).map(t=>`<span class="chip">${esc(t)}</span>`).join("")+(n.note?` <span title="${esc(n.note)}">📝</span>`:"")+((n.colls||[]).length?` <span title="${esc(n.colls.join(", "))}">📚</span>`:"");
 let LB={collections:[],tags:[]},tagFilter="";
@@ -2763,6 +2842,30 @@ function addRows(tb,items,lvl,psize,after){let prev=after;for(const n of items){
 async function toggle(tr){const n=tr.n;if(!n.dir||!n.files)return;const tg=tr.querySelector(".tg");
  if(tr.open){let nx=tr.nextSibling;while(nx&&nx.lvl>tr.lvl){const x=nx;nx=nx.nextSibling;x.remove()}tr.open=false;tg.textContent="▸";return}
  const d=await api("/api/children?path="+encodeURIComponent(n.path)+"&limit=200"+rqa(rootPath));addRows(tr.parentNode,d.children,tr.lvl+1,n.size,tr);resort(tr.parentNode);tr.open=true;tg.textContent="▾"}
+// ---- файлы (как в WizTree)
+async function rFiles(g=rGen){const m=$("#main");
+ m.innerHTML=`<div style="padding:8px 12px;display:flex;flex-wrap:wrap;gap:6px;align-items:center"><input id="fq" style="width:240px" placeholder="Поиск по имени или пути…"><input id="fe" style="width:130px" placeholder="расш: mp4, iso"><label>от <input id="fmin" type="number" value="0" min="0" step="10" style="width:65px"> МБ</label><label>Сорт. <select id="fsort"><option value="size">по размеру</option><option value="m">по изменению</option><option value="a">по доступу</option><option value="c">по созданию</option><option value="name">по имени</option></select></label><select id="flim"><option value="500">500</option><option value="1000">1000</option><option value="2000">2000</option></select><button id="fgo" class="p">Показать</button><button id="fcsv">Экспорт CSV</button><b id="fsum"></b></div><div id="fext" style="padding:0 12px 6px;display:flex;flex-wrap:wrap;gap:4px"></div><div id="ft"></div>`;
+ let items=[],tm=null;
+ const run=async()=>{const lg=rGen;
+  const u=`/api/files?q=${encodeURIComponent($("#fq").value.trim())}&ext=${encodeURIComponent($("#fe").value.trim())}&min=${encodeURIComponent($("#fmin").value||0)}&sort=${$("#fsort").value}&limit=${$("#flim").value}`+rqa(rootPath);
+  const d=await api(u);if(lg!==rGen||g!==rGen)return;
+  if(!d||d.error){$("#fsum").textContent=(d&&d.error)||"Нет данных";$("#ft").innerHTML="";return}
+  items=d.items;const kmb=d.keep?(d.keep/(1<<20)).toFixed(1).replace(/\.0$/,""):"0";
+  $("#fsum").textContent=`найдено ${d.count.toLocaleString()}, всего ${fmt(d.total)}`+(d.keep?` (в кэше файлы ≥ ${kmb} МБ)`:"");
+  const curExt=$("#fe").value.trim().toLowerCase().replace(/^\./,"");
+  $("#fext").innerHTML=d.exts.map(([ex,sz,cnt])=>`<span class="chip" data-e="${esc(ex)}" style="${curExt==ex.replace(/^\./,"")?"outline:2px solid var(--acc)":""}">${esc(ex)} · ${fmt(sz)} (${cnt})</span>`).join("");
+  const rsz=d.root_size||1;
+  $("#ft").innerHTML=`<table><thead><tr><th>Путь<th>Размер<th>% диска<th>Тип<th>Создан<th>Изменён<th>Доступ<th>Теги</thead><tbody>`+items.map((n,i)=>{const pct=n.size/rsz*100;return `<tr class="r" data-i="${i}"><td class="nm" title="${esc(n.path)}">📄 <a class="op" href="#" data-open="${esc(n.path)}" title="Открыть в Проводнике">${esc(n.path)}</a><td>${fmt(n.size)}<td><span class="bar" style="width:${Math.round(pct*0.8)}px"></span> ${pct.toFixed(1)}%<td>${esc(n.ext||"—")}<td>${dt(n.t[0])}<td style="color:${col(n.t[1])}">${dt(n.t[1])}<td style="color:${col(n.t[2])}">${dt(n.t[2])}<td class="wr">${tg(n)}`}).join("")+`</tbody></table>`;
+  enhance($("#ft").querySelector("table"));
+  $("#ft").onclick=e=>{const tr=e.target.closest("tr.r");if(!tr)return;document.querySelectorAll("tr.sel").forEach(x=>x.classList.remove("sel"));tr.classList.add("sel");pick(items[tr.dataset.i])}};
+ $("#fext").onclick=e=>{const c=e.target.closest(".chip");if(!c)return;const v=c.dataset.e=="(без расш.)"?"":c.dataset.e.replace(/^\./,"");$("#fe").value=$("#fe").value.trim().toLowerCase().replace(/^\./,"")==v?"":v;run()};
+ const deb=()=>{clearTimeout(tm);tm=setTimeout(run,250)};
+ $("#fq").oninput=deb;$("#fe").oninput=deb;
+ $("#fq").onkeydown=e=>{if(e.key=="Enter"){clearTimeout(tm);run()}};$("#fe").onkeydown=e=>{if(e.key=="Enter"){clearTimeout(tm);run()}};
+ $("#fsort").onchange=run;$("#flim").onchange=run;$("#fgo").onclick=run;
+ $("#fcsv").onclick=()=>{const q=v=>`"${String(v).replace(/"/g,'""')}"`;const t="путь;размер_байт;тип;создан;изменён;доступ\n"+items.map(n=>[q(n.path),n.size,q(n.ext||""),dt(n.t[0]),dt(n.t[1]),dt(n.t[2])].join(";")).join("\n");
+  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["\ufeff"+t],{type:"text/csv"}));a.download="files.csv";a.click()};
+ run()}
 // ---- карта
 async function rMap(g=rGen){const m=$("#main");m.innerHTML=`<div id="crumb"></div><canvas id="tm"></canvas>`;const cv=$("#tm");cv.width=m.clientWidth;cv.height=m.clientHeight;
  const d=await api("/api/children?path="+encodeURIComponent(mapPath)+"&limit=300"+rqa(rootPath));if(g!==rGen)return;

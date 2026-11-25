@@ -72,6 +72,7 @@ class Scan:
         self.state = "idle"
         self.root = None
         self.root_path = ""
+        self.scan_path = ""
         self.files = 0
         self.bytes = 0
         self.cur = ""
@@ -90,7 +91,7 @@ class Scan:
         self.cancel = False
         self.files = self.bytes = self.errors = 0
         self.keep = int(keep_mb * (1 << 20))
-        self.root_path = path
+        self.scan_path = path
         self.t0 = time.time()
         try:
             st = os.stat(path)
@@ -102,7 +103,9 @@ class Scan:
                 old = None if full else load_scan(path, keep_mb)
                 log("сканирование %s (%s)" % (path, "быстрое, по кэшу" if old else "полное"))
                 root = self._dir(path, path, st.st_ctime, st.st_mtime, old)
-            self.root = root
+            if root is not None:
+                self.root = root
+                self.root_path = path
             self.state = "cancelled" if self.cancel else "done"
             if self.state == "done":
                 save_cards()
@@ -2210,7 +2213,8 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/status":
             el = time.time() - SC.t0 if SC.state == "scanning" else SC.elapsed
             return self.send({"state": SC.state, "files": SC.files, "bytes": SC.bytes, "cur": SC.cur,
-                              "elapsed": el, "errors": SC.errors, "root": SC.root_path, "cached": SC.cached, "reused": SC.reused})
+                              "elapsed": el, "errors": SC.errors, "root": SC.root_path, "scan_path": SC.scan_path,
+                              "cached": SC.cached, "reused": SC.reused})
         if u.path == "/api/icon":
             b = icon_png(q.get("path", ""))
             if b is None:
@@ -2379,7 +2383,7 @@ footer span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 <div id="logw" style="display:none;background:var(--pan);border-top:1px solid var(--line)"><div style="padding:2px 12px;color:var(--mut)">📜 Логи сервера <button id="logc">Очистить</button> <button id="logx">✕</button></div><pre id="logp" style="margin:0;padding:4px 12px;height:22vh;overflow:auto;font-size:12px;user-select:text"></pre></div>
 <footer><span id="sel" style="min-width:200px">—</span><select id="coll" title="Коллекция"></select><button id="tocoll" disabled>В коллекцию</button><button id="tags" disabled>Теги…</button><button id="sug" disabled>Теги ИИ</button><select id="model" title="Локальная модель Ollama"></select><button id="desc" disabled>Что это? (ИИ)</button><button id="rev" disabled>Показать в Проводнике</button><button id="cp" disabled>Копировать путь</button><button id="tomap" disabled>На карте</button><button id="tr" disabled>В корзину</button><button id="rm" disabled style="color:#d33">Удалить навсегда</button></footer>
 <script>
-const $=s=>document.querySelector(s);let sep="\\",view="tree",sel=null,mapPath=null,poll=null,rootPath="";
+const $=s=>document.querySelector(s);let sep="\\",view="tree",sel=null,mapPath=null,poll=null,rootPath="",rGen=0;
 const fmt=b=>{const u=["Б","КБ","МБ","ГБ","ТБ"];let i=0;while(b>=1024&&i<4){b/=1024;i++}return (i?b.toFixed(b<10?2:1):b)+" "+u[i]};
 const dt=t=>t?new Date(t*1000).toISOString().slice(0,10):"";
 const fi=()=>({c:0,m:1,a:2}[$("#field").value]);
@@ -2389,9 +2393,11 @@ const esc=s=>s.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 async function api(u,b){const r=await fetch(u,b?{method:"POST",body:JSON.stringify(b)}:{});return r.json()}
 (async()=>{const d=await api("/api/drives");sep=d.sep;$("#drv").innerHTML=d.drives.map(x=>`<button data-d="${esc(x)}">${esc(x)}</button>`).join("");
  $("#path").value=d.drives[0];try{const l=localStorage.getItem("dv_root");if(l)$("#path").value=l}catch(e){}$("#drv").onclick=e=>{if(e.target.dataset.d)$("#path").value=e.target.dataset.d};
- const s=await api("/api/status");if(s.state=="done"){rootPath=s.root;$("#path").value=s.root;show(s)}})();
-$("#go").onclick=async()=>{const r=await api("/api/scan",{path:$("#path").value.trim(),keep:+$("#keep").value,full:$("#full").checked});if(r.error)return alert(r.error);
- $("#go").disabled=true;$("#stop").disabled=false;poll=setInterval(tick,500)};
+ const s=await api("/api/status");if(s.state=="done"&&s.root){rootPath=s.root;$("#path").value=s.root;show(s)}
+ else if(s.state=="scanning"){if(s.root){rootPath=s.root;mapPath=s.root;render()}$("#path").value=s.scan_path||s.root||$("#path").value;$("#go").disabled=true;$("#stop").disabled=false;tick();clearInterval(poll);poll=setInterval(tick,500)}})();
+$("#go").onclick=async()=>{const r=await api("/api/scan",{path:$("#path").value.trim(),keep:+$("#keep").value,full:$("#full").checked});
+ if(r.error){if(r.error=="уже идёт"){$("#go").disabled=true;$("#stop").disabled=false;tick();clearInterval(poll);poll=setInterval(tick,500);return}return alert(r.error)}
+ $("#go").disabled=true;$("#stop").disabled=false;clearInterval(poll);poll=setInterval(tick,500)};
 $("#stop").onclick=()=>api("/api/cancel",{});
 async function tick(){const s=await api("/api/status");
  $("#st").textContent=s.state=="scanning"?`Сканирую… ${s.files.toLocaleString()} файлов, ${fmt(s.bytes)}, ${s.elapsed.toFixed(0)} с — ${s.cur}`:`${s.state}: ${s.files.toLocaleString()} файлов, ${fmt(s.bytes)}, ${s.elapsed.toFixed(1)} с, недоступных папок: ${s.errors}`;
@@ -2412,7 +2418,7 @@ $("#rsv").onclick=async()=>{const b=$("#rsv");b.disabled=true;b.textContent="↻
 $("#quit").onclick=async()=>{if(!confirm("Остановить сервер DiskView и закрыть программу?"))return;try{await api("/api/quit",{})}catch(x){}document.body.innerHTML='<div style="padding:40px;font:16px sans-serif">Сервер остановлен. Эту вкладку можно закрыть.</div>';window.close()};
 document.querySelector("nav").onclick=e=>{if(!e.target.dataset.v)return;view=e.target.dataset.v;document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("on",b==e.target));render()};
 $("#field").onchange=render;
-function render(){if(!rootPath&&view!="lib"&&view!="launch"){$("#main").innerHTML=`<div style="padding:24px;color:var(--mut)">Диск ещё не просканирован (после перезапуска сервера результат сканирования сбрасывается). <button id="go2" class="p">Сканировать ${esc($("#path").value)}</button></div>`;$("#go2").onclick=()=>$("#go").click();return}({tree:rTree,map:rMap,old:rOld,lib:rLib,launch:rLaunch})[view]()}
+function render(){const g=++rGen;if(!rootPath&&view!="lib"&&view!="launch"){$("#main").innerHTML=`<div style="padding:24px;color:var(--mut)">Диск ещё не просканирован (после перезапуска сервера результат сканирования сбрасывается). <button id="go2" class="p">Сканировать ${esc($("#path").value)}</button></div>`;$("#go2").onclick=()=>$("#go").click();return}({tree:rTree,map:rMap,old:rOld,lib:rLib,launch:rLaunch})[view](g)}
 const RK=["можно чистить","осторожно","защищено"];
 const tg=n=>(n.tags||[]).map(t=>`<span class="chip">${esc(t)}</span>`).join("")+(n.note?` <span title="${esc(n.note)}">📝</span>`:"")+((n.colls||[]).length?` <span title="${esc(n.colls.join(", "))}">📚</span>`:"");
 let LB={collections:[],tags:[]},tagFilter="";
@@ -2490,8 +2496,11 @@ function enhance(T){const tb=T.tBodies[0],ths=[...T.tHead.rows[0].cells];
    const up=()=>{h.classList.remove("on");document.removeEventListener("mousemove",mv);document.removeEventListener("mouseup",up)};
    document.addEventListener("mousemove",mv);document.addEventListener("mouseup",up)}})}
 // ---- дерево
-async function rTree(){const m=$("#main");m.innerHTML=`<table><thead><tr><th>Имя<th>Размер<th>% от родителя<th>Файлов<th>Создан<th>Изменён<th>Доступ<th>Теги</thead><tbody id="tb"></tbody></table>`;enhance(m.querySelector("table"));
- const d=await api("/api/children?path="+encodeURIComponent(rootPath));addRows($("#tb"),d.children,0,d.node.size,null)}
+async function rTree(g=rGen){const m=$("#main");m.innerHTML=`<table><thead><tr><th>Имя<th>Размер<th>% от родителя<th>Файлов<th>Создан<th>Изменён<th>Доступ<th>Теги</thead><tbody id="tb"></tbody></table>`;enhance(m.querySelector("table"));
+ const d=await api("/api/children?path="+encodeURIComponent(rootPath));if(g!==rGen)return;
+ if(!d||d.error||!d.node){const s=await api("/api/status");if(g!==rGen)return;if(s.root&&s.root!==rootPath){rootPath=s.root;mapPath=s.root;return render()}
+  $("#tb").innerHTML=`<tr><td colspan="8" style="padding:16px;color:var(--mut)">${esc((d&&d.error)||"Нет данных. Нажмите «Сканировать».")}</td></tr>`;return}
+ addRows($("#tb"),d.children,0,d.node.size,null)}
 function addRows(tb,items,lvl,psize,after){let prev=after;for(const n of items){const tr=document.createElement("tr");tr.className="r";tr.n=n;tr.lvl=lvl;
  const pct=psize?n.size/psize*100:0,f=fi();
  tr.innerHTML=`<td class="nm" style="padding-left:${8+lvl*16}px" title="${esc(n.path)}"><span class="tg">${n.dir&&n.files?"▸":""}</span>${n.dir?"📁":n.misc?"…":"📄"} ${esc(n.name)}<td>${fmt(n.size)}<td><span class="bar" style="width:${Math.round(pct*0.8)}px"></span> ${pct.toFixed(1)}%<td>${n.misc?"":n.files.toLocaleString()}<td>${dt(n.t[0])}<td style="color:${col(n.t[1])}">${dt(n.t[1])}<td style="color:${col(n.t[2])}">${dt(n.t[2])}<td class="wr">${tg(n)}`;
@@ -2502,8 +2511,11 @@ async function toggle(tr){const n=tr.n;if(!n.dir||!n.files)return;const tg=tr.qu
  if(tr.open){let nx=tr.nextSibling;while(nx&&nx.lvl>tr.lvl){const x=nx;nx=nx.nextSibling;x.remove()}tr.open=false;tg.textContent="▸";return}
  const d=await api("/api/children?path="+encodeURIComponent(n.path)+"&limit=200");addRows(tr.parentNode,d.children,tr.lvl+1,n.size,tr);resort(tr.parentNode);tr.open=true;tg.textContent="▾"}
 // ---- карта
-async function rMap(){const m=$("#main");m.innerHTML=`<div id="crumb"></div><canvas id="tm"></canvas>`;const cv=$("#tm");cv.width=m.clientWidth;cv.height=m.clientHeight;
- const d=await api("/api/children?path="+encodeURIComponent(mapPath)+"&limit=300");const ctx=cv.getContext("2d");
+async function rMap(g=rGen){const m=$("#main");m.innerHTML=`<div id="crumb"></div><canvas id="tm"></canvas>`;const cv=$("#tm");cv.width=m.clientWidth;cv.height=m.clientHeight;
+ const d=await api("/api/children?path="+encodeURIComponent(mapPath)+"&limit=300");if(g!==rGen)return;
+ if(!d||d.error){const s=await api("/api/status");if(g!==rGen)return;if(s.root&&s.root!==rootPath){rootPath=s.root;mapPath=s.root;return render()}
+  m.innerHTML=`<div style="padding:16px;color:var(--mut)">${esc((d&&d.error)||"Нет данных.")}</div>`;return}
+ const ctx=cv.getContext("2d");
  const parts=mapPath.slice(rootPath.length).split(sep).filter(Boolean);let acc=rootPath.replace(/[\\\/]$/,"");
  $("#crumb").innerHTML=`<a href="#" data-p="${esc(rootPath)}">${esc(rootPath)}</a>`+parts.map(p=>{acc+=sep+p;return ` ${sep} <a href="#" data-p="${esc(acc)}">${esc(p)}</a>`}).join("");
  $("#crumb").onclick=e=>{e.preventDefault();if(e.target.dataset.p){mapPath=e.target.dataset.p;rMap()}};
@@ -2524,8 +2536,9 @@ function squarify(items,x,y,w,h){const tot=items.reduce((a,b)=>a+b.v,0),sc=w*h/t
   else{const rh=s/rc.w;let xx=rc.x;for(const r of row){const ww=r.a/rh;out.push({it:r,x:xx,y:rc.y,w:ww,h:rh});xx+=ww}rc={x:rc.x,y:rc.y+rh,w:rc.w,h:rc.h-rh}}}
  return out}
 // ---- мёртвые папки
-async function rOld(){const m=$("#main");m.innerHTML=`<div style="padding:8px 12px">Не менялись дольше <input id="yrs" type="number" value="2" step="0.5" min="0" style="width:60px"> лет (по полю «Возраст по» сверху), размер от <input id="mn" type="number" value="500" style="width:70px"> МБ <button id="ap" class="p">Показать</button> <button id="csv">Экспорт CSV</button> <b id="sum"></b></div><div id="ot"></div>`;
- let items=[];const run=async()=>{const d=await api(`/api/stale?field=${$("#field").value}&years=${$("#yrs").value}&min=${$("#mn").value}`);items=d.items;
+async function rOld(g=rGen){const m=$("#main");m.innerHTML=`<div style="padding:8px 12px">Не менялись дольше <input id="yrs" type="number" value="2" step="0.5" min="0" style="width:60px"> лет (по полю «Возраст по» сверху), размер от <input id="mn" type="number" value="500" style="width:70px"> МБ <button id="ap" class="p">Показать</button> <button id="csv">Экспорт CSV</button> <b id="sum"></b></div><div id="ot"></div>`;
+ let items=[];const run=async()=>{const lg=rGen;const d=await api(`/api/stale?field=${$("#field").value}&years=${$("#yrs").value}&min=${$("#mn").value}`);if(lg!==rGen||g!==rGen)return;
+  if(!d||d.error){$("#sum").textContent=(d&&d.error)||"Нет данных";$("#ot").innerHTML="";return}items=d.items;
   $("#sum").textContent=`найдено ${d.count}, всего ${fmt(d.total)}`;
   $("#ot").innerHTML=`<table><thead><tr><th>Путь<th>Размер<th>Что внутри<th>Программа<th>Совет<th>Создан<th>Изменён<th>Доступ<th>Теги</thead><tbody>`+items.map((n,i)=>`<tr class="r" data-i="${i}"><td class="nm" title="${esc(n.path)}">${n.dir?"📁":"📄"} ${esc(n.path)}<td>${fmt(n.size)}<td class="wr">${n.cats.map(c=>c[0]+" "+fmt(c[1])).join(", ")}<td class="wr">${esc(n.prog)}<td class="rk rk${n.risk}">${RK[n.risk]}<td>${dt(n.t[0])}<td>${dt(n.t[1])}<td>${dt(n.t[2])}<td class="wr">${tg(n)}`).join("")+`</tbody></table>`;
   enhance($("#ot").querySelector("table"));$("#ot").onclick=e=>{const tr=e.target.closest("tr.r");if(!tr)return;document.querySelectorAll("tr.sel").forEach(x=>x.classList.remove("sel"));tr.classList.add("sel");pick(items[tr.dataset.i])}};

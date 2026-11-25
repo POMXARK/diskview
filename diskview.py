@@ -108,8 +108,8 @@ class Scan:
                 self.root_path = path
             self.state = "cancelled" if self.cancel else "done"
             if self.state == "done":
-                save_cards()
-                save_scan()
+                save_cards(self)
+                save_scan(self)
                 log("сканирование готово: %d файлов, папок из кэша %d, %.1f с" % (self.files, self.reused, time.time() - self.t0))
         except OSError as e:
             self.state = "error: %s" % e
@@ -288,24 +288,101 @@ class Scan:
         return d
 
     def find(self, path):
-        if self.root is None:
+        if self.root is None or not path:
             return None
-        if path == self.root_path:
+        p = _norm_root(path)
+        rp = _norm_root(self.root_path)
+        if os.path.normcase(p) == os.path.normcase(rp):
             return self.root
-        pre = self.root_path.rstrip("\\/") + os.sep
-        if not path.startswith(pre):
+        pre = rp.rstrip("\\/") + os.sep
+        if not os.path.normcase(p).startswith(os.path.normcase(pre)):
             return None
         d = self.root
-        for part in path[len(pre):].split(os.sep):
+        for part in p[len(pre):].split(os.sep):
             if part == "":
                 continue
-            d = d.dirs.get(part)
-            if d is None:
+            nxt = d.dirs.get(part)
+            if nxt is None and os.name == "nt":
+                pl = part.lower()
+                for k, v in d.dirs.items():
+                    if k.lower() == pl:
+                        nxt = v
+                        break
+            if nxt is None:
                 return None
+            d = nxt
         return d
 
 
+def _norm_root(path):
+    p = os.path.normpath((path or "").strip())
+    if os.name == "nt" and len(p) == 2 and p[1] == ":" and p[0].isalpha():
+        p += "\\"
+    return p
+
+
+def _skey(path):
+    return os.path.normcase(_norm_root(path))
+
+
+_SC_LOCK = threading.Lock()
 SC = Scan()
+SCANS = {}
+
+
+def get_scan(root=None, load_cache=True):
+    if not root:
+        return SC
+    k = _skey(root)
+    with _SC_LOCK:
+        sc = SCANS.get(k)
+    if sc is not None or not load_cache:
+        return sc
+    nr = _norm_root(root)
+    m = load_scan(nr, meta_only=True)
+    if not m:
+        return None
+    t = load_scan(nr)
+    if t is None:
+        return None
+    sc = Scan()
+    sc.root, sc.root_path, sc.scan_path, sc.state = t, _norm_root(m["path"]), _norm_root(m["path"]), "done"
+    sc.files, sc.bytes, sc.errors, sc.elapsed, sc.keep, sc.cached = (
+        m["files"], m["bytes"], m["errors"], m["elapsed"], m["keep"], m["ts"]
+    )
+    with _SC_LOCK:
+        if k not in SCANS:
+            SCANS[k] = sc
+        return SCANS[k]
+
+
+def find_scan_for_path(path):
+    if not path:
+        return SC
+    np = os.path.normcase(_norm_root(path))
+    with _SC_LOCK:
+        cands = list(SCANS.values())
+    best, best_len = None, -1
+    for sc in cands:
+        if sc.root is None or not sc.root_path:
+            continue
+        rp = os.path.normcase(_norm_root(sc.root_path))
+        pre = rp.rstrip("\\/") + os.sep
+        if np == rp or np.startswith(pre):
+            if len(rp) > best_len:
+                best, best_len = sc, len(rp)
+    return best or SC
+
+
+def scans_summary():
+    with _SC_LOCK:
+        vals = list(SCANS.values())
+    out = []
+    for sc in vals:
+        r = sc.root_path or sc.scan_path
+        if r:
+            out.append({"root": r, "state": sc.state, "files": sc.files, "bytes": sc.bytes})
+    return out
 
 
 def _scan_file(path):
@@ -340,16 +417,19 @@ def _undump(a):
     return d
 
 
-def save_scan():
+def save_scan(sc=None):
     """Результат сканирования на диск (gzip): после перезапуска сервера он не теряется, повторный скан обновляет только изменившееся."""
     import gzip
+    sc = sc or SC
+    if sc.root is None or not sc.root_path:
+        return
     try:
         os.makedirs(DATA, exist_ok=True)
-        meta = {"path": SC.root_path, "keep": SC.keep, "ts": int(time.time()), "files": SC.files, "bytes": SC.bytes,
-                "errors": SC.errors, "elapsed": SC.elapsed}
+        meta = {"path": sc.root_path, "keep": sc.keep, "ts": int(time.time()), "files": sc.files, "bytes": sc.bytes,
+                "errors": sc.errors, "elapsed": sc.elapsed}
         sys.setrecursionlimit(max(sys.getrecursionlimit(), 5000))
-        with gzip.open(os.path.join(DATA, _scan_file(SC.root_path)), "wt", encoding="utf-8", compresslevel=1) as f:
-            json.dump({"meta": meta, "tree": _dump(SC.root)}, f, ensure_ascii=False)
+        with gzip.open(os.path.join(DATA, _scan_file(sc.root_path)), "wt", encoding="utf-8", compresslevel=1) as f:
+            json.dump({"meta": meta, "tree": _dump(sc.root)}, f, ensure_ascii=False)
         _jsave("scan_last.json", meta)
     except (OSError, RecursionError) as e:
         log("не удалось сохранить скан: %s" % e)
@@ -369,15 +449,21 @@ def load_scan(path, keep_mb=None, meta_only=False):
 
 
 def restore_scan():
+    global SC
     m = _jload("scan_last.json", None)
     if not m or SC.root is not None:
         return
-    t = load_scan(m["path"])
+    p = _norm_root(m["path"])
+    t = load_scan(p)
     if t is None:
         return
-    SC.root, SC.root_path, SC.state = t, m["path"], "done"
-    SC.files, SC.bytes, SC.errors, SC.elapsed, SC.keep, SC.cached = m["files"], m["bytes"], m["errors"], m["elapsed"], m["keep"], m["ts"]
-    log("скан восстановлен из кэша: %s, %d файлов (%s)" % (m["path"], m["files"], time.strftime("%Y-%m-%d %H:%M", time.localtime(m["ts"]))))
+    sc = Scan()
+    sc.root, sc.root_path, sc.scan_path, sc.state = t, p, p, "done"
+    sc.files, sc.bytes, sc.errors, sc.elapsed, sc.keep, sc.cached = m["files"], m["bytes"], m["errors"], m["elapsed"], m["keep"], m["ts"]
+    with _SC_LOCK:
+        SCANS[_skey(p)] = sc
+        SC = sc
+    log("скан восстановлен из кэша: %s, %d файлов (%s)" % (p, m["files"], time.strftime("%Y-%m-%d %H:%M", time.localtime(m["ts"]))))
 
 
 _PROGS = None
@@ -448,12 +534,13 @@ def program_of(path):
     return ""
 
 
-def protected(path):
+def protected(path, sc=None):
     """Системные места: целиком не предлагаются к удалению."""
+    sc = sc or find_scan_for_path(path)
     p = os.path.normpath(path)
     drive, rest = os.path.splitdrive(p)
     parts = [x for x in rest.replace("\\", "/").split("/") if x]
-    if not parts or p == os.path.normpath(SC.root_path):
+    if not parts or (sc.root_path and os.path.normcase(_norm_root(p)) == os.path.normcase(_norm_root(sc.root_path))):
         return True
     if len(parts) == 1 and parts[0].lower() in PROTECTED_TOP:
         return True
@@ -470,8 +557,8 @@ def cats_of(d, n=3):
     return [[k, v] for k, v in top[:n]]
 
 
-def risk_of(d, path, prog):
-    if protected(path):
+def risk_of(d, path, prog, sc=None):
+    if protected(path, sc):
         return 2
     if prog:
         return 1
@@ -480,11 +567,12 @@ def risk_of(d, path, prog):
     return 0
 
 
-def jdir(d, path):
+def jdir(d, path, sc=None):
+    sc = sc or find_scan_for_path(path)
     prog = program_of(path) if os.name == "nt" else ""
-    return {"name": d.name if path != SC.root_path else path, "path": path, "dir": True,
+    return {"name": d.name if _skey(path) != _skey(sc.root_path) else path, "path": path, "dir": True,
             "size": d.size, "files": d.files, "t": d.t, "err": d.err, "cats": cats_of(d),
-            "prog": prog, "risk": risk_of(d, path, prog),
+            "prog": prog, "risk": risk_of(d, path, prog, sc),
             "tags": LIB["tags"].get(path, {}).get("tags", []), "note": LIB["tags"].get(path, {}).get("note", ""),
             "colls": _PCOLL.get(path, [])}
 
@@ -495,11 +583,14 @@ def jfile(f, parent):
             "tags": LIB["tags"].get(os.path.join(parent, f[0]), {}).get("tags", []), "note": "", "colls": []}
 
 
-def children(path, limit):
-    d = SC.find(path)
+def children(path, limit, root=None):
+    sc = get_scan(root) if root else find_scan_for_path(path)
+    if sc is None:
+        return None
+    d = sc.find(path)
     if d is None:
         return None
-    items = [jdir(c, os.path.join(path, n)) for n, c in d.dirs.items()]
+    items = [jdir(c, os.path.join(path, n), sc) for n, c in d.dirs.items()]
     items += [jfile(f, path) for f in d.fl]
     items.sort(key=lambda x: -x["size"])
     rest = d.size - sum(i["size"] for i in items)
@@ -508,38 +599,40 @@ def children(path, limit):
     if rest + hidden > 0:
         out.append({"name": "(мелкие файлы и остальное)", "path": "", "dir": False, "misc": True,
                     "size": rest + hidden, "files": 0, "t": [0, 0, 0]})
-    return {"node": jdir(d, path), "children": out}
+    return {"node": jdir(d, path, sc), "children": out}
 
 
-def stale(field, years, min_size, limit):
+def stale(field, years, min_size, limit, root=None):
     """Самые внешние папки/файлы, к которым не прикасались дольше срока."""
     idx = {"c": 0, "m": 1, "a": 2}[field]
     cutoff = time.time() - years * 365.25 * 86400
+    sc = get_scan(root) if root else SC
     res = []
 
     def walk(d, path):
         for n, c in d.dirs.items():
             p = os.path.join(path, n)
             if c.size >= min_size and c.files > 0 and 0 < c.t[idx] < cutoff:
-                res.append(jdir(c, p))
+                res.append(jdir(c, p, sc))
             else:
                 walk(c, p)
         for f in d.fl:
             if f[1] >= min_size and f[2 + idx] < cutoff:
                 res.append(jfile(f, path))
 
-    if SC.root:
-        walk(SC.root, SC.root_path)
+    if sc and sc.root:
+        walk(sc.root, sc.root_path)
     res.sort(key=lambda x: -x["size"])
     return {"total": sum(r["size"] for r in res), "count": len(res), "items": res[:limit]}
 
 
 def detach(path):
     """Убрать узел из дерева и вычесть его размер у предков."""
-    pre = SC.root_path.rstrip("\\/") + os.sep
-    if SC.root is None or not path.startswith(pre):
+    sc = find_scan_for_path(path)
+    pre = sc.root_path.rstrip("\\/") + os.sep
+    if sc.root is None or not os.path.normcase(path).startswith(os.path.normcase(pre)):
         return
-    chain, d = [SC.root], SC.root
+    chain, d = [sc.root], sc.root
     parts = [x for x in path[len(pre):].split(os.sep) if x]
     for part in parts[:-1]:
         d = d.dirs.get(part)
@@ -559,10 +652,11 @@ def detach(path):
 
 
 def check_target(path):
-    d = SC.find(path)
-    if d is None or protected(path):
+    sc = find_scan_for_path(path)
+    d = sc.find(path)
+    if d is None or protected(path, sc):
         return "это место защищено или не из сканирования"
-    if SC.state == "scanning":
+    if sc.state == "scanning":
         return "идёт сканирование"
     return ""
 
@@ -1122,7 +1216,7 @@ AN = _jload("analysis.json", {})
 def ai_cached(kind, path, model, force, make):
     """Кэш ответов модели (analysis.json): результат по папке переиспользуется, пока размер и число файлов
     изменились меньше чем на 3% («умное обновление»); иначе или по force считается заново."""
-    d = SC.find(path)
+    d = find_scan_for_path(path).find(path)
     if d is None:
         return {"error": "нет такой папки"}
     k = kind + "|" + os.path.normcase(path)
@@ -1194,7 +1288,8 @@ def under(path, root):
     return a == b or a.startswith(b + os.sep)
 
 
-def build_cards(minsize=50 << 20):
+def build_cards(minsize=50 << 20, sc=None):
+    sc = sc or SC
     out = []
 
     def walk(d, path, depth):
@@ -1206,18 +1301,21 @@ def build_cards(minsize=50 << 20):
         for n, c in d.dirs.items():
             if c.size >= minsize or depth < 2:
                 walk(c, os.path.join(path, n), depth + 1)
-    walk(SC.root, SC.root_path, 0)
+    walk(sc.root, sc.root_path, 0)
     out.sort(key=lambda x: -x["size"])
     return out[:30000]
 
 
-def save_cards():
+def save_cards(sc=None):
     global CARDS, _IDX
-    if SC.root is None or SC.state != "done":
+    sc = sc or SC
+    if sc.root is None or sc.state != "done":
         return
-    CARDS = [c for c in CARDS if not under(c["path"], SC.root_path)] + build_cards()
-    _IDX = None
-    _jsave("cards.json", CARDS)
+    cards = build_cards(sc=sc)
+    with _SC_LOCK:
+        CARDS = [c for c in CARDS if not under(c["path"], sc.root_path)] + cards
+        _IDX = None
+        _jsave("cards.json", CARDS)
 
 
 def all_cards():
@@ -1406,9 +1504,10 @@ def sample_hash(path, size):
     return h.hexdigest()
 
 
-def dups(min_bytes=10 << 20, words=(), limit=200):
+def dups(min_bytes=10 << 20, words=(), limit=200, root=None):
     """Файлы одинакового размера и содержимого (по выборке) среди сохранённых в дереве."""
     by = {}
+    sc = get_scan(root) if root else SC
 
     def walk(d, path):
         for f in d.fl:
@@ -1416,8 +1515,8 @@ def dups(min_bytes=10 << 20, words=(), limit=200):
                 by.setdefault(f[1], []).append(os.path.join(path, f[0]))
         for n, c in d.dirs.items():
             walk(c, os.path.join(path, n))
-    if SC.root:
-        walk(SC.root, SC.root_path)
+    if sc and sc.root:
+        walk(sc.root, sc.root_path)
     groups = []
     for size, ps in by.items():
         if len(ps) < 2:
@@ -2169,11 +2268,18 @@ def drives():
 
 
 def reveal(path):
-    d = SC.find(os.path.dirname(path)) if path else None
-    if d is None and SC.find(path) is None and not in_library(path):
+    if not path:
+        return False
+    sc = find_scan_for_path(path)
+    d = sc.find(os.path.dirname(path))
+    if d is None and sc.find(path) is None and not in_library(path) and not os.path.exists(path):
         return False
     if os.name == "nt":
-        subprocess.Popen(["explorer", "/select,", path])
+        np = _norm_root(path)
+        if len(np) == 3 and np[1:] == ":\\":
+            subprocess.Popen(["explorer", np])
+        else:
+            subprocess.Popen(["explorer", "/select,", np])
     elif sys.platform == "darwin":
         subprocess.Popen(["open", "-R", path])
     else:
@@ -2211,10 +2317,16 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/drives":
             return self.send({"drives": drives(), "sep": os.sep})
         if u.path == "/api/status":
-            el = time.time() - SC.t0 if SC.state == "scanning" else SC.elapsed
-            return self.send({"state": SC.state, "files": SC.files, "bytes": SC.bytes, "cur": SC.cur,
-                              "elapsed": el, "errors": SC.errors, "root": SC.root_path, "scan_path": SC.scan_path,
-                              "cached": SC.cached, "reused": SC.reused})
+            rq = q.get("root", "")
+            sc = get_scan(rq) if rq else SC
+            if sc is None:
+                return self.send({"state": "idle", "files": 0, "bytes": 0, "cur": "", "elapsed": 0,
+                                  "errors": 0, "root": "", "scan_path": rq, "cached": 0, "reused": 0,
+                                  "scans": scans_summary()})
+            el = time.time() - sc.t0 if sc.state == "scanning" else sc.elapsed
+            return self.send({"state": sc.state, "files": sc.files, "bytes": sc.bytes, "cur": sc.cur,
+                              "elapsed": el, "errors": sc.errors, "root": sc.root_path, "scan_path": sc.scan_path,
+                              "cached": sc.cached, "reused": sc.reused, "scans": scans_summary()})
         if u.path == "/api/icon":
             b = icon_png(q.get("path", ""))
             if b is None:
@@ -2244,13 +2356,17 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/config":
             return self.send(cfg_public())
         if u.path == "/api/dups":
-            return self.send(dups(int(float(q.get("min", 10)) * (1 << 20))))
+            return self.send(dups(int(float(q.get("min", 10)) * (1 << 20)), root=q.get("root")))
         if u.path == "/api/children":
-            r = children(q.get("path", SC.root_path), int(q.get("limit", 400)))
+            rq = q.get("root")
+            sc_def = get_scan(rq) if rq else SC
+            p = q.get("path", sc_def.root_path if sc_def else "")
+            r = children(p, int(q.get("limit", 400)), root=rq)
             return self.send(r if r else {"error": "нет такой папки"}, 200 if r else 404)
         if u.path == "/api/stale":
             return self.send(stale(q.get("field", "m"), float(q.get("years", 1)),
-                                   float(q.get("min", 100)) * (1 << 20), int(q.get("limit", 500))))
+                                   float(q.get("min", 100)) * (1 << 20), int(q.get("limit", 500)),
+                                   root=q.get("root")))
         self.send({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -2266,15 +2382,28 @@ class H(BaseHTTPRequestHandler):
             threading.Thread(target=SRV[0].shutdown, daemon=True).start()
             return
         if u.path == "/api/scan":
-            if SC.state == "scanning":
-                return self.send({"error": "уже идёт"}, 409)
-            p = b.get("path", "")
+            global SC
+            p = _norm_root(b.get("path", ""))
             if not os.path.isdir(p):
                 return self.send({"error": "нет такой папки"}, 400)
-            threading.Thread(target=SC.run, args=(p, float(b.get("keep", 1)), bool(b.get("full"))), daemon=True).start()
-            return self.send({"ok": True})
+            k = _skey(p)
+            with _SC_LOCK:
+                sc = SCANS.get(k)
+                if sc is None:
+                    sc = Scan()
+                    SCANS[k] = sc
+                if sc.state == "scanning":
+                    return self.send({"error": "уже идёт"}, 409)
+                SC = sc
+                sc.state = "scanning"
+                sc.scan_path = p
+            threading.Thread(target=sc.run, args=(p, float(b.get("keep", 1)), bool(b.get("full"))), daemon=True).start()
+            return self.send({"ok": True, "root": p})
         if u.path == "/api/cancel":
-            SC.cancel = True
+            rq = b.get("root", "")
+            sc = get_scan(rq, load_cache=False) if rq else SC
+            if sc is not None:
+                sc.cancel = True
             return self.send({"ok": True})
         if u.path == "/api/upload":
             try:
@@ -2349,6 +2478,7 @@ td.nm{max-width:520px;overflow:hidden;text-overflow:ellipsis}.tg{display:inline-
 footer{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:6px 12px;background:var(--pan);border-top:1px solid var(--line)}
 footer span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .legend{display:flex;align-items:center;gap:4px;color:var(--mut)}.legend i{width:90px;height:8px;background:linear-gradient(90deg,hsl(130,55%,45%),hsl(65,55%,45%),hsl(0,55%,45%))}
+.op{color:inherit;text-decoration:none;cursor:pointer}.op:hover{text-decoration:underline;color:var(--acc)}.opi{opacity:.55;margin-left:5px;font-size:11px;text-decoration:none;color:inherit}.opi:hover{opacity:1;color:var(--acc)}
 </style></head><body>
 <header>
  <span id="drv"></span>
@@ -2383,26 +2513,37 @@ footer span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 <div id="logw" style="display:none;background:var(--pan);border-top:1px solid var(--line)"><div style="padding:2px 12px;color:var(--mut)">📜 Логи сервера <button id="logc">Очистить</button> <button id="logx">✕</button></div><pre id="logp" style="margin:0;padding:4px 12px;height:22vh;overflow:auto;font-size:12px;user-select:text"></pre></div>
 <footer><span id="sel" style="min-width:200px">—</span><select id="coll" title="Коллекция"></select><button id="tocoll" disabled>В коллекцию</button><button id="tags" disabled>Теги…</button><button id="sug" disabled>Теги ИИ</button><select id="model" title="Локальная модель Ollama"></select><button id="desc" disabled>Что это? (ИИ)</button><button id="rev" disabled>Показать в Проводнике</button><button id="cp" disabled>Копировать путь</button><button id="tomap" disabled>На карте</button><button id="tr" disabled>В корзину</button><button id="rm" disabled style="color:#d33">Удалить навсегда</button></footer>
 <script>
-const $=s=>document.querySelector(s);let sep="\\",view="tree",sel=null,mapPath=null,poll=null,rootPath="",rGen=0;
+const $=s=>document.querySelector(s);let sep="\\",view="tree",sel=null,mapPath=null,poll=null,rootPath="",scanTarget="",rGen=0;
 const fmt=b=>{const u=["Б","КБ","МБ","ГБ","ТБ"];let i=0;while(b>=1024&&i<4){b/=1024;i++}return (i?b.toFixed(b<10?2:1):b)+" "+u[i]};
 const dt=t=>t?new Date(t*1000).toISOString().slice(0,10):"";
 const fi=()=>({c:0,m:1,a:2}[$("#field").value]);
 const age=t=>t?(Date.now()/1000-t)/31557600:0;
 const col=t=>{const h=130*(1-Math.min(age(t)/3,1));return `hsl(${h},55%,45%)`};
 const esc=s=>s.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const rq=r=>r?"?root="+encodeURIComponent(r):"";
+const rqa=r=>r?"&root="+encodeURIComponent(r):"";
 async function api(u,b){const r=await fetch(u,b?{method:"POST",body:JSON.stringify(b)}:{});return r.json()}
+document.addEventListener("click",e=>{const a=e.target.closest("a.op[data-open],a.opi[data-open]");if(!a)return;e.preventDefault();e.stopPropagation();api("/api/reveal",{path:a.dataset.open})});
+function startPoll(t){scanTarget=t;$("#go").disabled=true;$("#stop").disabled=false;clearInterval(poll);tick();poll=setInterval(tick,500)}
 (async()=>{const d=await api("/api/drives");sep=d.sep;$("#drv").innerHTML=d.drives.map(x=>`<button data-d="${esc(x)}">${esc(x)}</button>`).join("");
- $("#path").value=d.drives[0];try{const l=localStorage.getItem("dv_root");if(l)$("#path").value=l}catch(e){}$("#drv").onclick=e=>{if(e.target.dataset.d)$("#path").value=e.target.dataset.d};
- const s=await api("/api/status");if(s.state=="done"&&s.root){rootPath=s.root;$("#path").value=s.root;show(s)}
- else if(s.state=="scanning"){if(s.root){rootPath=s.root;mapPath=s.root;render()}$("#path").value=s.scan_path||s.root||$("#path").value;$("#go").disabled=true;$("#stop").disabled=false;tick();clearInterval(poll);poll=setInterval(tick,500)}})();
-$("#go").onclick=async()=>{const r=await api("/api/scan",{path:$("#path").value.trim(),keep:+$("#keep").value,full:$("#full").checked});
- if(r.error){if(r.error=="уже идёт"){$("#go").disabled=true;$("#stop").disabled=false;tick();clearInterval(poll);poll=setInterval(tick,500);return}return alert(r.error)}
- $("#go").disabled=true;$("#stop").disabled=false;clearInterval(poll);poll=setInterval(tick,500)};
-$("#stop").onclick=()=>api("/api/cancel",{});
-async function tick(){const s=await api("/api/status");
- $("#st").textContent=s.state=="scanning"?`Сканирую… ${s.files.toLocaleString()} файлов, ${fmt(s.bytes)}, ${s.elapsed.toFixed(0)} с — ${s.cur}`:`${s.state}: ${s.files.toLocaleString()} файлов, ${fmt(s.bytes)}, ${s.elapsed.toFixed(1)} с, недоступных папок: ${s.errors}`;
- if(s.state!="scanning"){clearInterval(poll);$("#go").disabled=false;$("#stop").disabled=true;if(s.state=="done"||s.state=="cancelled")show(s)}}
-function show(s){rootPath=s.root;s.cachedTxt=s.cached?" · из кэша от "+new Date(s.cached*1000).toLocaleString()+" — «Сканировать» обновит только изменившееся":(s.reused?" · из кэша папок: "+s.reused:"");try{localStorage.setItem("dv_root",s.root)}catch(e){}mapPath=s.root;$("#st").textContent=`${s.root}: ${s.files.toLocaleString()} файлов, ${fmt(s.bytes)}, ${s.elapsed.toFixed(1)} с, недоступных папок: ${s.errors}${s.cachedTxt}`;render()}
+ let hashRoot="";try{if(location.hash.length>1)hashRoot=decodeURIComponent(location.hash.slice(1))}catch(e){}
+ $("#path").value=hashRoot||d.drives[0];if(!hashRoot)try{const l=localStorage.getItem("dv_root");if(l)$("#path").value=l}catch(e){}
+ $("#drv").onclick=async e=>{const dv=e.target.dataset.d;if(!dv)return;$("#path").value=dv;
+  const s=await api("/api/status"+rq(dv));if(s.state=="done"&&s.root)show(s);
+  else if(s.state=="scanning"){if(s.root){rootPath=s.root;mapPath=s.root;render()}startPoll(s.scan_path||dv)}
+  else{clearInterval(poll);scanTarget="";rootPath="";mapPath=null;$("#go").disabled=false;$("#stop").disabled=true;$("#st").textContent=`${dv}: не сканировался. Нажмите «Сканировать».`;render()}};
+ const s=await api("/api/status"+rq(hashRoot));
+ if(s.state=="done"&&s.root){$("#path").value=s.root;show(s)}
+ else if(s.state=="scanning"){if(s.root){rootPath=s.root;mapPath=s.root;render()}$("#path").value=s.scan_path||s.root||$("#path").value;startPoll(s.scan_path||hashRoot||s.root)}
+ else if(hashRoot){render()}})();
+$("#go").onclick=async()=>{const p=$("#path").value.trim();const r=await api("/api/scan",{path:p,keep:+$("#keep").value,full:$("#full").checked});
+ if(r.error){if(r.error=="уже идёт"){startPoll(p);return}return alert(r.error)}
+ startPoll(r.root||p)};
+$("#stop").onclick=()=>api("/api/cancel",{root:scanTarget||rootPath});
+async function tick(){const t=scanTarget||rootPath;const s=await api("/api/status"+rq(t));
+ $("#st").textContent=s.state=="scanning"?`Сканирую ${s.scan_path||t}… ${s.files.toLocaleString()} файлов, ${fmt(s.bytes)}, ${s.elapsed.toFixed(0)} с — ${s.cur}`:`${s.state}: ${s.files.toLocaleString()} файлов, ${fmt(s.bytes)}, ${s.elapsed.toFixed(1)} с, недоступных папок: ${s.errors}`;
+ if(s.state!="scanning"){clearInterval(poll);$("#go").disabled=false;$("#stop").disabled=true;scanTarget="";if((s.state=="done"||s.state=="cancelled")&&s.root)show(s)}}
+function show(s){rootPath=s.root;s.cachedTxt=s.cached?" · из кэша от "+new Date(s.cached*1000).toLocaleString()+" — «Сканировать» обновит только изменившееся":(s.reused?" · из кэша папок: "+s.reused:"");try{localStorage.setItem("dv_root",s.root);history.replaceState(null,"","#"+encodeURIComponent(s.root))}catch(e){}document.title=s.root+" — DiskView";mapPath=s.root;$("#st").textContent=`${s.root}: ${s.files.toLocaleString()} файлов, ${fmt(s.bytes)}, ${s.elapsed.toFixed(1)} с, недоступных папок: ${s.errors}${s.cachedTxt}`;render()}
 document.addEventListener("click",e=>{const a=e.target.closest(".shots a");if(!a)return;e.preventDefault();e.stopPropagation();
  const L=[...a.closest(".shots").querySelectorAll("a")].map(x=>x.getAttribute("href"));let k=L.indexOf(a.getAttribute("href"));
  const o=document.createElement("div");o.id="lbx";o.innerHTML=`<img referrerpolicy="no-referrer"><b class="lp">‹</b><b class="ln">›</b><b class="lx">✕</b><span class="lc"></span>`;
@@ -2428,7 +2569,7 @@ $("#logb").onclick=()=>{const w=$("#logw"),on=w.style.display=="none";w.style.di
 $("#logx").onclick=()=>$("#logb").click();$("#logc").onclick=()=>{$("#logp").textContent=""};
 $("#coll").onchange=e=>{LCOL=e.target.value;if(view=="lib"||view=="launch")render()};
 libLoad();
-function pick(n){sel=n;$("#sel").textContent=n?`${n.path||n.name} — ${fmt(n.size)}`:"—";const ok=n&&n.path;$("#rev").disabled=$("#cp").disabled=!ok;$("#tomap").disabled=!(n&&n.dir);
+function pick(n){sel=n;const p=n&&(n.path||n.name);$("#sel").innerHTML=n?(n.path?`<a class="op" href="#" data-open="${esc(n.path)}" title="Открыть в Проводнике">${esc(n.path)}</a> — ${fmt(n.size)}`:`${esc(p)} — ${fmt(n.size)}`):"—";const ok=n&&n.path;$("#rev").disabled=$("#cp").disabled=!ok;$("#tomap").disabled=!(n&&n.dir);
  $("#desc").disabled=!(n&&n.dir&&n.path);$("#web").disabled=!(n&&n.path);$("#tr").disabled=$("#rm").disabled=!(ok&&n.risk!==2);$("#tocoll").disabled=$("#tags").disabled=!ok;$("#sug").disabled=!(n&&n.dir&&ok)}
 async function loadModels(){const r=await api("/api/models");const m=r.models.slice();if(r.model&&!m.includes(r.model))m.unshift(r.model);
  $("#model").innerHTML=m.map(x=>`<option>${esc(x)}</option>`).join("")||"<option value=''>⚙ задайте модель</option>";$("#model").title="Модель ("+r.profile+(r.recommended?"; рекомендуется "+r.recommended:"")+")";const w=r.model||r.recommended;if(w&&m.includes(w))$("#model").value=w;$("#cmd").placeholder=r.recommended?"рекомендуется "+r.recommended:"имя модели"}
@@ -2497,23 +2638,24 @@ function enhance(T){const tb=T.tBodies[0],ths=[...T.tHead.rows[0].cells];
    document.addEventListener("mousemove",mv);document.addEventListener("mouseup",up)}})}
 // ---- дерево
 async function rTree(g=rGen){const m=$("#main");m.innerHTML=`<table><thead><tr><th>Имя<th>Размер<th>% от родителя<th>Файлов<th>Создан<th>Изменён<th>Доступ<th>Теги</thead><tbody id="tb"></tbody></table>`;enhance(m.querySelector("table"));
- const d=await api("/api/children?path="+encodeURIComponent(rootPath));if(g!==rGen)return;
- if(!d||d.error||!d.node){const s=await api("/api/status");if(g!==rGen)return;if(s.root&&s.root!==rootPath){rootPath=s.root;mapPath=s.root;return render()}
+ const d=await api("/api/children?path="+encodeURIComponent(rootPath)+rqa(rootPath));if(g!==rGen)return;
+ if(!d||d.error||!d.node){const s=await api("/api/status"+rq(rootPath));if(g!==rGen)return;if(s.root&&s.root!==rootPath){rootPath=s.root;mapPath=s.root;return render()}
   $("#tb").innerHTML=`<tr><td colspan="8" style="padding:16px;color:var(--mut)">${esc((d&&d.error)||"Нет данных. Нажмите «Сканировать».")}</td></tr>`;return}
  addRows($("#tb"),d.children,0,d.node.size,null)}
 function addRows(tb,items,lvl,psize,after){let prev=after;for(const n of items){const tr=document.createElement("tr");tr.className="r";tr.n=n;tr.lvl=lvl;
  const pct=psize?n.size/psize*100:0,f=fi();
- tr.innerHTML=`<td class="nm" style="padding-left:${8+lvl*16}px" title="${esc(n.path)}"><span class="tg">${n.dir&&n.files?"▸":""}</span>${n.dir?"📁":n.misc?"…":"📄"} ${esc(n.name)}<td>${fmt(n.size)}<td><span class="bar" style="width:${Math.round(pct*0.8)}px"></span> ${pct.toFixed(1)}%<td>${n.misc?"":n.files.toLocaleString()}<td>${dt(n.t[0])}<td style="color:${col(n.t[1])}">${dt(n.t[1])}<td style="color:${col(n.t[2])}">${dt(n.t[2])}<td class="wr">${tg(n)}`;
+ const op=n.path?`<a class="opi" href="#" data-open="${esc(n.path)}" title="Открыть в Проводнике">↗</a>`:"";
+ tr.innerHTML=`<td class="nm" style="padding-left:${8+lvl*16}px" title="${esc(n.path)}"><span class="tg">${n.dir&&n.files?"▸":""}</span>${n.dir?"📁":n.misc?"…":"📄"} ${esc(n.name)}${op}<td>${fmt(n.size)}<td><span class="bar" style="width:${Math.round(pct*0.8)}px"></span> ${pct.toFixed(1)}%<td>${n.misc?"":n.files.toLocaleString()}<td>${dt(n.t[0])}<td style="color:${col(n.t[1])}">${dt(n.t[1])}<td style="color:${col(n.t[2])}">${dt(n.t[2])}<td class="wr">${tg(n)}`;
  tr.onclick=e=>{document.querySelectorAll("tr.sel").forEach(x=>x.classList.remove("sel"));tr.classList.add("sel");pick(n);if(e.target.classList.contains("tg"))toggle(tr)};
  tr.ondblclick=()=>n.dir&&toggle(tr);
  if(prev)prev.after(tr);else tb.appendChild(tr);prev=tr}}
 async function toggle(tr){const n=tr.n;if(!n.dir||!n.files)return;const tg=tr.querySelector(".tg");
  if(tr.open){let nx=tr.nextSibling;while(nx&&nx.lvl>tr.lvl){const x=nx;nx=nx.nextSibling;x.remove()}tr.open=false;tg.textContent="▸";return}
- const d=await api("/api/children?path="+encodeURIComponent(n.path)+"&limit=200");addRows(tr.parentNode,d.children,tr.lvl+1,n.size,tr);resort(tr.parentNode);tr.open=true;tg.textContent="▾"}
+ const d=await api("/api/children?path="+encodeURIComponent(n.path)+"&limit=200"+rqa(rootPath));addRows(tr.parentNode,d.children,tr.lvl+1,n.size,tr);resort(tr.parentNode);tr.open=true;tg.textContent="▾"}
 // ---- карта
 async function rMap(g=rGen){const m=$("#main");m.innerHTML=`<div id="crumb"></div><canvas id="tm"></canvas>`;const cv=$("#tm");cv.width=m.clientWidth;cv.height=m.clientHeight;
- const d=await api("/api/children?path="+encodeURIComponent(mapPath)+"&limit=300");if(g!==rGen)return;
- if(!d||d.error){const s=await api("/api/status");if(g!==rGen)return;if(s.root&&s.root!==rootPath){rootPath=s.root;mapPath=s.root;return render()}
+ const d=await api("/api/children?path="+encodeURIComponent(mapPath)+"&limit=300"+rqa(rootPath));if(g!==rGen)return;
+ if(!d||d.error){const s=await api("/api/status"+rq(rootPath));if(g!==rGen)return;if(s.root&&s.root!==rootPath){rootPath=s.root;mapPath=s.root;return render()}
   m.innerHTML=`<div style="padding:16px;color:var(--mut)">${esc((d&&d.error)||"Нет данных.")}</div>`;return}
  const ctx=cv.getContext("2d");
  const parts=mapPath.slice(rootPath.length).split(sep).filter(Boolean);let acc=rootPath.replace(/[\\\/]$/,"");
@@ -2537,10 +2679,10 @@ function squarify(items,x,y,w,h){const tot=items.reduce((a,b)=>a+b.v,0),sc=w*h/t
  return out}
 // ---- мёртвые папки
 async function rOld(g=rGen){const m=$("#main");m.innerHTML=`<div style="padding:8px 12px">Не менялись дольше <input id="yrs" type="number" value="2" step="0.5" min="0" style="width:60px"> лет (по полю «Возраст по» сверху), размер от <input id="mn" type="number" value="500" style="width:70px"> МБ <button id="ap" class="p">Показать</button> <button id="csv">Экспорт CSV</button> <b id="sum"></b></div><div id="ot"></div>`;
- let items=[];const run=async()=>{const lg=rGen;const d=await api(`/api/stale?field=${$("#field").value}&years=${$("#yrs").value}&min=${$("#mn").value}`);if(lg!==rGen||g!==rGen)return;
+ let items=[];const run=async()=>{const lg=rGen;const d=await api(`/api/stale?field=${$("#field").value}&years=${$("#yrs").value}&min=${$("#mn").value}`+rqa(rootPath));if(lg!==rGen||g!==rGen)return;
   if(!d||d.error){$("#sum").textContent=(d&&d.error)||"Нет данных";$("#ot").innerHTML="";return}items=d.items;
   $("#sum").textContent=`найдено ${d.count}, всего ${fmt(d.total)}`;
-  $("#ot").innerHTML=`<table><thead><tr><th>Путь<th>Размер<th>Что внутри<th>Программа<th>Совет<th>Создан<th>Изменён<th>Доступ<th>Теги</thead><tbody>`+items.map((n,i)=>`<tr class="r" data-i="${i}"><td class="nm" title="${esc(n.path)}">${n.dir?"📁":"📄"} ${esc(n.path)}<td>${fmt(n.size)}<td class="wr">${n.cats.map(c=>c[0]+" "+fmt(c[1])).join(", ")}<td class="wr">${esc(n.prog)}<td class="rk rk${n.risk}">${RK[n.risk]}<td>${dt(n.t[0])}<td>${dt(n.t[1])}<td>${dt(n.t[2])}<td class="wr">${tg(n)}`).join("")+`</tbody></table>`;
+  $("#ot").innerHTML=`<table><thead><tr><th>Путь<th>Размер<th>Что внутри<th>Программа<th>Совет<th>Создан<th>Изменён<th>Доступ<th>Теги</thead><tbody>`+items.map((n,i)=>`<tr class="r" data-i="${i}"><td class="nm" title="${esc(n.path)}">${n.dir?"📁":"📄"} <a class="op" href="#" data-open="${esc(n.path)}" title="Открыть в Проводнике">${esc(n.path)}</a><td>${fmt(n.size)}<td class="wr">${n.cats.map(c=>c[0]+" "+fmt(c[1])).join(", ")}<td class="wr">${esc(n.prog)}<td class="rk rk${n.risk}">${RK[n.risk]}<td>${dt(n.t[0])}<td>${dt(n.t[1])}<td>${dt(n.t[2])}<td class="wr">${tg(n)}`).join("")+`</tbody></table>`;
   enhance($("#ot").querySelector("table"));$("#ot").onclick=e=>{const tr=e.target.closest("tr.r");if(!tr)return;document.querySelectorAll("tr.sel").forEach(x=>x.classList.remove("sel"));tr.classList.add("sel");pick(items[tr.dataset.i])}};
  $("#csv").onclick=()=>{const q=v=>`"${String(v).replace(/"/g,'""')}"`;const t="путь;размер_байт;что_внутри;программа;совет;создан;изменён;доступ\n"+items.map(n=>[q(n.path),n.size,q(n.cats.map(c=>c[0]).join(", ")),q(n.prog),RK[n.risk],dt(n.t[0]),dt(n.t[1]),dt(n.t[2])].join(";")).join("\n");
   const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["﻿"+t],{type:"text/csv"}));a.download="dead-folders.csv";a.click()};
